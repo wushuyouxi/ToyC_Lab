@@ -1,0 +1,20 @@
+// 性能:小函数调用密集(测试内联)
+// sum(i=0..299) 3*(i+1) = 3*45150 = 135450 → % 256 = 26
+// expect: 26
+int triple(int x) {
+    return x * 3;
+}
+
+int add1(int x) {
+    return x + 1;
+}
+
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 300) {
+        s = s + triple(add1(i));
+        i = i + 1;
+    }
+    return s % 256;
+}

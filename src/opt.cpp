@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -101,6 +102,15 @@ bool constant_propagation(IRFunction& f) {
       out.push_back(std::move(in));
       continue;
     }
+    // 拷贝传播:沿 MOV 别名链改写操作数(别名仅在定义点之后、源被重定义之前
+    // 有效,重定义时 kill_aliases_to 已清除;到达标签清空,保守正确)。
+    int r1 = resolve(in.rs1), r2 = resolve(in.rs2);
+    if (r1 != in.rs1) { in.rs1 = r1; changed = true; }
+    if (r2 != in.rs2) { in.rs2 = r2; changed = true; }
+    for (auto& a : in.args) {
+      int ra = resolve(a);
+      if (ra != a) { a = ra; changed = true; }
+    }
     // 各类"定义"指令:先失效旧常量/别名
     if (in.rd >= 0 && in.op != IROp::MOV) {
       known.erase(in.rd);
@@ -129,6 +139,32 @@ bool constant_propagation(IRFunction& f) {
       case IROp::LT: case IROp::GT: case IROp::LE: case IROp::GE: case IROp::EQ: case IROp::NE: {
         auto l = known.find(resolve(in.rs1));
         auto r = known.find(resolve(in.rs2));
+        // x == 0 ⟺ !x:改写为 NOT(seqz 单指令,省 xor+seqz 两条)
+        if (in.op == IROp::EQ && r != known.end() && r->second == 0) {
+          in.op = IROp::NOT;
+          in.rs2 = -1;
+          changed = true;
+          if (l != known.end()) {  // 立即折叠
+            in.op = IROp::LOADIMM;
+            in.imm = (l->second == 0) ? 1 : 0;
+            in.rs1 = -1;
+            known[in.rd] = in.imm;
+          }
+          break;
+        }
+        if (in.op == IROp::EQ && l != known.end() && l->second == 0) {
+          in.op = IROp::NOT;
+          in.rs1 = in.rs2;
+          in.rs2 = -1;
+          changed = true;
+          if (r != known.end()) {
+            in.op = IROp::LOADIMM;
+            in.imm = (r->second == 0) ? 1 : 0;
+            in.rs1 = -1;
+            known[in.rd] = in.imm;
+          }
+          break;
+        }
         // 单常量加减 → ADDK/SUBK(代码生成直发 addi,省 li+add 两条)
         if (in.op == IROp::ADD && l == known.end() && r != known.end()) {
           in.op = IROp::ADDK;
@@ -466,136 +502,476 @@ bool dead_code_elimination(IRFunction& f) {
 
 }  // namespace
 
+// ---------- 遍 4b:定义-使用合并 ----------
+// 单定义、单使用且使用者是 MOV 的临时量,把定义直接写入 MOV 的目标:
+//   r_tmp = i + 1;  i = r_tmp;   →   i = i + 1;
+// 消除循环携带变量更新时的 addi+mv 两连(每迭代省一条指令)。
+// 安全性要求:MOV 目标在定义与 MOV 之间没有被其他指令使用。
+bool coalesce_def_use(IRFunction& f) {
+  std::unordered_map<int, int> def_count;
+  std::unordered_map<int, int> def_idx;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    if (f.code[i].rd >= 0 && f.code[i].op != IROp::LABEL) {
+      ++def_count[f.code[i].rd];
+      def_idx[f.code[i].rd] = static_cast<int>(i);
+    }
+  }
+  std::unordered_map<int, int> use_count;
+  for (const auto& in : f.code) {
+    if (in.rs1 >= 0) ++use_count[in.rs1];
+    if (in.rs2 >= 0) ++use_count[in.rs2];
+    for (int a : in.args) ++use_count[a];
+  }
+  std::vector<char> drop(f.code.size(), 0);
+  bool changed = false;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    const Instr& in = f.code[i];
+    if (in.op != IROp::MOV || in.rs1 < 0) continue;
+    int src = in.rs1, dst = in.rd;
+    if (src == dst) continue;
+    if (def_count[src] != 1 || use_count[src] != 1) continue;
+    int d = def_idx[src];
+    if (d >= static_cast<int>(i)) continue;
+    bool used_between = false;
+    for (size_t k = d + 1; k < i && !used_between; ++k) {
+      const Instr& o = f.code[k];
+      if (o.rs1 == dst || o.rs2 == dst) used_between = true;
+      for (int a : o.args)
+        if (a == dst) {
+          used_between = true;
+          break;
+        }
+    }
+    if (used_between) continue;
+    f.code[d].rd = dst;  // 定义直接写入 MOV 目标
+    drop[i] = 1;         // 删除该 MOV
+    changed = true;
+  }
+  if (!changed) return false;
+  std::vector<Instr> out;
+  for (size_t i = 0; i < f.code.size(); ++i)
+    if (!drop[i]) out.push_back(std::move(f.code[i]));
+  f.code = std::move(out);
+  return true;
+}
+
+// ---------- 遍 5:函数内联(模块级) ----------
+// 把叶子小函数展开进调用点:消除调用/序言/尾声开销;实参为常量时,
+// 后续常量传播在展开体上生效,相当于函数特化。被调体 vreg 整体平移重定位,
+// 标签加唯一后缀,形参用 MOV 绑定实参,RETURN 改写为对结果 vreg 的 MOV。
+bool inline_calls(IRModule& m) {
+  std::unordered_map<std::string, int> func_idx;
+  for (size_t i = 0; i < m.functions.size(); ++i) func_idx[m.functions[i].name] = static_cast<int>(i);
+
+  auto is_inlinable = [](const IRFunction& g, const std::string& caller) {
+    if (g.name == "main" || g.name == caller) return false;
+    for (const auto& in : g.code)
+      if (in.op == IROp::CALL) return false;  // 只内联叶子函数
+    return g.code.size() <= 30;
+  };
+
+  bool changed = false;
+  int seq = 0;  // 进程内唯一标签后缀
+  for (auto& f : m.functions) {
+    std::vector<Instr> out;
+    for (const Instr& in : f.code) {
+      if (in.op != IROp::CALL) {
+        out.push_back(in);
+        continue;
+      }
+      auto it = func_idx.find(in.func);
+      if (it == func_idx.end() || !is_inlinable(m.functions[it->second], f.name)) {
+        out.push_back(in);
+        continue;
+      }
+      const IRFunction& g = m.functions[it->second];
+      std::string suffix = "_inl" + std::to_string(seq++);
+      std::string end_label = ".Linl_end" + std::to_string(seq - 1) + "_" + f.name;
+      int base = f.max_vreg;
+      // 形参 vreg 映射(ARG imm → vreg)
+      std::unordered_map<int, int> param_vreg;
+      for (const auto& gi : g.code)
+        if (gi.op == IROp::ARG) param_vreg[static_cast<int>(gi.imm)] = gi.rd;
+      int result = f.max_vreg + g.max_vreg;
+      f.max_vreg = result + 1;
+      // 实参 → 形参 vreg
+      for (size_t i = 0; i < in.args.size(); ++i) {
+        Instr mv;
+        mv.op = IROp::MOV;
+        mv.rd = base + param_vreg[static_cast<int>(i)];
+        mv.rs1 = in.args[i];
+        mv.line = in.line;
+        out.push_back(std::move(mv));
+      }
+      // 展开被调函数体。关键:RETURN 改写为「写结果 + 跳转到内联块结尾」——
+      // 否则 return 路径会落进其后的循环体继续执行(prime 回归暴露)。
+      for (size_t j = 0; j < g.code.size(); ++j) {
+        const Instr& gi = g.code[j];
+        if (gi.op == IROp::ARG) continue;
+        if (gi.op == IROp::RETURN || gi.op == IROp::RETURNVOID) {
+          if (gi.op == IROp::RETURN) {
+            Instr mv;
+            mv.op = IROp::MOV;
+            mv.rd = result;
+            mv.rs1 = base + gi.rs1;
+            mv.line = in.line;
+            out.push_back(std::move(mv));
+          }
+          Instr jmp;
+          jmp.op = IROp::JUMP;
+          jmp.label = end_label;
+          out.push_back(std::move(jmp));
+          // 其后到下一个 LABEL 的代码不可达(与 eliminate_unreachable 一致)
+          while (j + 1 < g.code.size() && g.code[j + 1].op != IROp::LABEL) ++j;
+          continue;
+        }
+        Instr c = gi;
+        if (c.rd >= 0) c.rd += base;
+        if (c.rs1 >= 0) c.rs1 += base;
+        if (c.rs2 >= 0) c.rs2 += base;
+        for (auto& a : c.args) a += base;
+        if (c.op == IROp::LABEL) c.label += suffix;
+        else if (!c.label.empty()) c.label += suffix;
+        out.push_back(std::move(c));
+      }
+      Instr lend;
+      lend.op = IROp::LABEL;
+      lend.label = end_label;
+      out.push_back(std::move(lend));
+      // 调用结果 → 调用处 rd
+      if (in.rd >= 0) {
+        Instr mv;
+        mv.op = IROp::MOV;
+        mv.rd = in.rd;
+        mv.rs1 = result;
+        mv.line = in.line;
+        out.push_back(std::move(mv));
+      }
+      changed = true;
+    }
+    f.code = std::move(out);
+  }
+  return changed;
+}
+
+// ---------- 遍 6:全局变量寄存器提升(仅叶子函数) ----------
+// 叶子函数不调用任何函数 → 全局不可能被他人修改:
+// 入口加载一次到缓存 vreg,函数内全部改走 MOV,每个出口写回。
+// 循环内反复读写全局的基准题每迭代省 la+lw / la+sw 4~5 条指令。
+// 惰性说明:入口加载放在 ARG 块之后 —— 对 main 而言位于运行时全局初始化代码之前,
+// 其 LOADGLOBAL/STOREGLOBAL 也被提升,读取的正是 .data 初值,语义不变。
+bool promote_globals(IRFunction& f) {
+  for (const auto& in : f.code)
+    if (in.op == IROp::CALL) return false;
+  std::vector<std::string> order;
+  for (const auto& in : f.code) {
+    if (in.op == IROp::LOADGLOBAL || in.op == IROp::STOREGLOBAL) {
+      if (std::find(order.begin(), order.end(), in.sym) == order.end()) order.push_back(in.sym);
+    }
+  }
+  if (order.empty()) return false;
+  std::unordered_map<std::string, int> cache;
+  for (auto& g : order) cache[g] = f.max_vreg++;
+  // ARG 块结束位置(入口加载插在此处)
+  size_t insert_at = 0;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    if (f.code[i].op == IROp::ARG) insert_at = i + 1;
+    else if (insert_at > 0) break;
+  }
+  std::vector<Instr> out;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    if (i == insert_at) {
+      for (auto& g : order) {
+        Instr ld;
+        ld.op = IROp::LOADGLOBAL;
+        ld.rd = cache[g];
+        ld.sym = g;
+        out.push_back(std::move(ld));
+      }
+    }
+    const Instr& in = f.code[i];
+    if (in.op == IROp::LOADGLOBAL && cache.count(in.sym)) {
+      Instr mv = in;
+      mv.op = IROp::MOV;
+      mv.rs1 = cache[in.sym];
+      mv.sym.clear();
+      out.push_back(std::move(mv));
+    } else if (in.op == IROp::STOREGLOBAL && cache.count(in.sym)) {
+      Instr mv = in;
+      mv.op = IROp::MOV;
+      mv.rd = cache[in.sym];
+      mv.sym.clear();
+      out.push_back(std::move(mv));
+    } else if (in.op == IROp::RETURN || in.op == IROp::RETURNVOID) {
+      for (auto& g : order) {
+        Instr st;
+        st.op = IROp::STOREGLOBAL;
+        st.rs1 = cache[g];
+        st.sym = g;
+        st.line = in.line;
+        out.push_back(std::move(st));
+      }
+      out.push_back(in);
+    } else {
+      out.push_back(in);
+    }
+  }
+  f.code = std::move(out);
+  return true;
+}
+
+// ---------- 遍 7:循环不变量外提(仅 LOADIMM) ----------
+// LOADIMM 是天然不变量:把循环体内的常量加载移到循环头之前。
+// ToyC 无 goto,循环头只能由顺序流(首次进入)与回边进入,
+// 外提后首次进入执行加载、后续迭代复用,语义不变。
+bool hoist_loop_imm(IRFunction& f) {
+  std::unordered_map<std::string, size_t> label_idx;
+  for (size_t i = 0; i < f.code.size(); ++i)
+    if (f.code[i].op == IROp::LABEL) label_idx[f.code[i].label] = i;
+  std::vector<std::pair<size_t, size_t>> loops;  // 回边构成的循环区间 [header, end]
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    const Instr& in = f.code[i];
+    if (in.op == IROp::JUMP || in.op == IROp::BRZ || in.op == IROp::BRNZ) {
+      auto it = label_idx.find(in.label);
+      if (it != label_idx.end() && it->second < i) loops.push_back({it->second, i});
+    }
+  }
+  if (loops.empty()) return false;
+  // 定义次数:常量传播的 MOV 折叠会把「MOV v, 常量」改写成第二个 LOADIMM v
+  // (v 在循环内另有重定义,如 j = j+1 的循环变量重置)—— 多定义的 vreg
+  // 不是不变量,禁止外提(while_nest 回归暴露)。
+  std::unordered_map<int, int> def_count;
+  for (const auto& in : f.code)
+    if (in.rd >= 0 && in.op != IROp::LABEL) ++def_count[in.rd];
+  std::map<size_t, std::vector<Instr>> insert_before;  // 最外层循环头 → 外提指令
+  std::unordered_set<size_t> to_remove;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    if (f.code[i].op != IROp::LOADIMM || f.code[i].rd < 0) continue;
+    if (def_count[f.code[i].rd] > 1) continue;  // 多定义:非不变量
+    size_t best = SIZE_MAX;
+    for (auto& L : loops)
+      if (L.first < i && i <= L.second) best = std::min(best, L.first);
+    if (best == SIZE_MAX) continue;
+    insert_before[best].push_back(f.code[i]);
+    to_remove.insert(i);
+  }
+  if (to_remove.empty()) return false;
+  std::vector<Instr> out;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    auto it = insert_before.find(i);
+    if (it != insert_before.end())
+      for (auto& in : it->second) out.push_back(in);
+    if (to_remove.count(i)) continue;
+    out.push_back(f.code[i]);
+  }
+  f.code = std::move(out);
+  return true;
+}
+
 // ---------- 优化入口:各遍迭代至不动点 ----------
 void optimize(IRModule& m) {
-  for (auto& f : m.functions) {
-    bool changed = true;
-    for (int iter = 0; changed && iter < 6; ++iter) {
-      changed = false;
+  for (int round = 0; round < 8; ++round) {
+    bool changed = false;
+    changed |= inline_calls(m);
+    for (auto& f : m.functions) {
       changed |= eliminate_unreachable(f);
       changed |= constant_propagation(f);
       changed |= strength_reduction(f);
+      changed |= coalesce_def_use(f);
       changed |= dead_code_elimination(f);
+      changed |= hoist_loop_imm(f);
     }
+    if (!changed) break;
+  }
+  // 收尾:全局提升(每函数至多一次,否则会把入口加载自身再"提升"导致错误)
+  for (auto& f : m.functions) {
+    promote_globals(f);
+    dead_code_elimination(f);  // 清理提升产生的死代码
   }
 }
 
-// ---------- 频率寄存器分配 ----------
-// 设计:每个物理寄存器至多分配给一个 vreg —— 无区间重叠判定,构造上保证正确。
-// - 跨调用存活的 vreg(定义与最后使用之间存在 CALL)只能进被调用者保存寄存器 s1-s11;
-// - 不跨调用的 vreg 可用 t3-t6 与 a0-a7;
-// - t0/t1/t2 留给代码生成的暂存与地址计算;
-// - 按"定义+使用"次数降序分配,排不上的溢出到栈槽(紧凑编号)。
+// ---------- 线性扫描寄存器分配 ----------
+// 按活跃区间 [first_def, last_use] 的起点排序逐一分配,已结束的区间释放寄存器,
+// 寄存器耗尽时把"存活最久"的区间踢到溢出槽(被踢者此后一律走槽,代码生成
+// 按最终分配表逐指令处理,天然正确)。
+// 池规则:
+//   - 跨调用存活(区间内部有 CALL)→ 仅 s1-s11(被调用者保存);
+//   - 形参 → s1-s11 优先,其次 t3-t6(绝不可进 a0-a7:序言拷贝 ARG 时会互相覆盖);
+//   - 其余 → t3-t6 与 a0-a7;区间恰在 call 处结束(实参)时偏好对应的 a_i。
+// 相比频率分配器,短命临时量在热循环里复用寄存器,不再被低使用频率误溢出。
 RegAlloc allocate_registers(const IRFunction& fn) {
   RegAlloc ra;
   const int n = fn.max_vreg;
   ra.alloc.resize(n);
 
-  std::vector<int> op_uses(n, 0);  // 仅操作数使用次数(直通判定的"单次使用")
-  std::vector<int> uses(n, 0);     // 定义+使用(频率排序的热度)
   std::vector<int> first_def(n, INT_MAX), last_use(n, -1);
+  std::vector<bool> is_param(n, false);
   bool leaf = true;
   std::vector<int> call_idx;
+  std::unordered_map<int, int> arg_pos;  // vreg → 该 call 的实参位置(仅单次实参使用时)
   for (size_t idx = 0; idx < fn.code.size(); ++idx) {
     const Instr& in = fn.code[idx];
     if (in.op == IROp::CALL) {
       leaf = false;
       call_idx.push_back(static_cast<int>(idx));
+      for (size_t i = 0; i < in.args.size() && i < 8; ++i)
+        arg_pos[in.args[i]] = static_cast<int>(i);
     }
     auto use = [&](int v) {
-      if (v >= 0) {
-        ++op_uses[v];
-        ++uses[v];
-        last_use[v] = static_cast<int>(idx);
-      }
+      if (v >= 0) last_use[v] = static_cast<int>(idx);
     };
     use(in.rs1);
     use(in.rs2);
     for (int a : in.args) use(a);
     if (in.rd >= 0 && in.op != IROp::LABEL) {
       first_def[in.rd] = std::min(first_def[in.rd], static_cast<int>(idx));
-      if (in.op != IROp::ARG) ++uses[in.rd];  // ARG 不计使用频率,参数不进热榜
+      if (in.op == IROp::ARG) is_param[in.rd] = true;
     }
   }
   ra.leaf = leaf;
 
+  // 循环区间(回边构成)——线性扫描的区间必须按"执行序"而非线性下标计算:
+  // 循环内的使用每次迭代都会再次发生,循环内的定义每次迭代都会重写寄存器。
+  // 保守修正:定义落在循环内 → 区间起点推到循环头;使用落在循环内 → 区间终点
+  // 推到循环尾(回边处)。basic.tc 回归:循环界常量(循环外定义)在每次迭代被
+  // 使用,若不扩展终点,其寄存器会被循环内的临时值抢占。
+  std::vector<std::pair<int, int>> loops;  // [header, back_edge]
+  for (size_t i = 0; i < fn.code.size(); ++i) {
+    const Instr& in = fn.code[i];
+    if (in.op == IROp::JUMP || in.op == IROp::BRZ || in.op == IROp::BRNZ) {
+      for (size_t j = 0; j < i; ++j)
+        if (fn.code[j].op == IROp::LABEL && fn.code[j].label == in.label)
+          loops.push_back({static_cast<int>(j), static_cast<int>(i)});
+    }
+  }
+  auto extend = [&](int p, bool is_def) -> int {
+    int best = p;
+    for (auto& L : loops)
+      if (L.first <= p && p <= L.second)
+        best = is_def ? std::min(best, L.first) : std::max(best, L.second);
+    return best;
+  };
+  for (int v = 0; v < n; ++v) {
+    if (first_def[v] != INT_MAX) first_def[v] = extend(first_def[v], /*is_def=*/true);
+    if (last_use[v] >= 0) last_use[v] = extend(last_use[v], /*is_def=*/false);
+  }
+
+  // 跨调用判定(实参在 call 处被消费,不算跨调用)
   std::vector<bool> crosses(n, false);
   for (int v = 0; v < n; ++v) {
     if (last_use[v] < 0) continue;
     for (int c : call_idx)
-      if (first_def[v] <= c && c <= last_use[v]) {
+      if (first_def[v] <= c && c < last_use[v]) {
         crosses[v] = true;
         break;
       }
   }
 
-  // 形参 vreg 禁止分配 a0-a7:序言中逐条拷贝 ARG 时,写入 a 寄存器
-  // 会覆盖尚未拷贝的其余实参(经典陷阱,见 args.tc 回归)。
-  std::vector<bool> is_param(n, false);
-  for (const Instr& in : fn.code)
-    if (in.op == IROp::ARG && in.rd >= 0 && in.rd < n) is_param[in.rd] = true;
+  // 区间按起点排序
+  std::vector<int> order;
+  for (int v = 0; v < n; ++v)
+    if (last_use[v] >= 0) order.push_back(v);
+  std::sort(order.begin(), order.end(), [&](int a, int b) {
+    if (first_def[a] != first_def[b]) return first_def[a] < first_def[b];
+    return last_use[a] < last_use[b];
+  });
 
   static const std::vector<std::string> s_pool = {
       "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
-
-  // 调用实参直通:只被某次 call 使用一次、且定义紧邻该 call 的 vreg,
-  // 直接分配到对应实参寄存器 a_i —— 定义指令直接写 a_i,调用时零搬运,
-  // 且该 vreg 不再需要被调用者保存(相比 s 寄存器省 2 条存/取)。
-  // 安全性:直通 vreg 的活跃区间是 [call-1, call],任何含该区间的区间都跨此 call,
-  // 不会被分配 a 寄存器,故与其他分配天然无冲突;不同 call 的直通区间互不相交。
-  std::vector<bool> assigned(n, false);
-  for (size_t idx = 0; idx < fn.code.size(); ++idx) {
-    const Instr& in = fn.code[idx];
-    if (in.op != IROp::CALL) continue;
-    for (size_t i = 0; i < in.args.size() && i < 8; ++i) {
-      int v = in.args[i];
-      if (v < 0 || v >= n || assigned[v]) continue;
-      if (op_uses[v] != 1) continue;                        // 单次使用(仅操作数)
-      if (first_def[v] != static_cast<int>(idx) - 1) continue;  // 定义紧邻 call
-      ra.alloc[v].is_reg = true;
-      ra.alloc[v].reg = "a" + std::to_string(i);
-      assigned[v] = true;
-    }
-  }
-
   static const std::vector<std::string> t_pool = {
       "t3", "t4", "t5", "t6", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"};
+  static const std::vector<std::string> param_t_pool = {"t3", "t4", "t5", "t6"};
 
-  std::vector<int> order;
-  for (int v = 0; v < n; ++v)
-    if (!assigned[v]) order.push_back(v);
-  std::sort(order.begin(), order.end(), [&](int a, int b) {
-    if (uses[a] != uses[b]) return uses[a] > uses[b];
-    return a < b;
-  });
+  // 活动寄存器表:reg → (占用的 vreg, 其 end)。s 与 t 分表,但同一表内的
+  // 寄存器互斥 —— t 表统一管理 t3-t6/a0-a7,形参只从 t3-t6 子集里挑,
+  // 从根本上杜绝"同一物理寄存器分给两个 vreg"。
+  struct Active {
+    std::unordered_map<std::string, std::pair<int, int>> m;
+    void expire(int cur_start) {
+      for (auto it = m.begin(); it != m.end();) {
+        if (it->second.second < cur_start) it = m.erase(it);  // 区间已结束,归还
+        else ++it;
+      }
+    }
+  };
+  Active s_act, t_act;
 
-  size_t si = 0, ti = 0;
+  // 从活动表中取一个空闲寄存器;池满则踢出 end 最远者(受害者改走溢出槽,
+  // 代码生成按最终分配表逐指令处理,定义/使用自动落到槽上)。
+  auto take_reg = [&](Active& act, const std::vector<std::string>& pool, int v, int end,
+                      int& slot_id) -> std::string {
+    for (const auto& r : pool)
+      if (!act.m.count(r)) {
+        act.m[r] = {v, end};
+        return r;
+      }
+    std::string victim_reg;
+    int victim_end = -1, victim_vreg = -1;
+    for (const auto& r : pool) {
+      auto it = act.m.find(r);
+      if (it != act.m.end() && it->second.second > victim_end) {
+        victim_end = it->second.second;
+        victim_reg = r;
+        victim_vreg = it->second.first;
+      }
+    }
+    if (victim_end > end) {
+      act.m.erase(victim_reg);
+      act.m[victim_reg] = {v, end};
+      ra.alloc[victim_vreg].is_reg = false;
+      ra.alloc[victim_vreg].slot = slot_id++;
+      return victim_reg;
+    }
+    return "";  // 溢出当前 vreg
+  };
+
+  auto push_used_s = [&](const std::string& r) {
+    if (std::find(ra.used_s.begin(), ra.used_s.end(), r) == ra.used_s.end())
+      ra.used_s.push_back(r);
+  };
+
   int slot_id = 0;
   for (int v : order) {
-    if (last_use[v] < 0) {  // 死 vreg:不占槽、不进寄存器
+    if (last_use[v] < 0) {
       ra.alloc[v].slot = -1;
       continue;
     }
-    if (is_param[v]) {  // 形参:s 寄存器或溢出,绝不进 a 寄存器,也不进 t 池
-      if (si < s_pool.size()) {
-        ra.alloc[v].is_reg = true;
-        ra.alloc[v].reg = s_pool[si++];
-        ra.used_s.push_back(s_pool[si - 1]);
+    int start = first_def[v], end = last_use[v];
+    s_act.expire(start);
+    t_act.expire(start);
+    if (is_param[v]) {  // 形参:s 优先 → t3-t6;绝不进 a 寄存器
+      std::string r = take_reg(s_act, s_pool, v, end, slot_id);
+      if (!r.empty()) {
+        ra.alloc[v] = {true, r, -1};
+        push_used_s(r);
       } else {
-        ra.alloc[v].slot = slot_id++;
-        ++ra.spilled;
+        r = take_reg(t_act, param_t_pool, v, end, slot_id);
+        if (!r.empty()) ra.alloc[v] = {true, r, -1};
+        else ra.alloc[v] = {false, "", slot_id++};
       }
-    } else if (crosses[v] && si < s_pool.size()) {
-      ra.alloc[v].is_reg = true;
-      ra.alloc[v].reg = s_pool[si++];
-      ra.used_s.push_back(s_pool[si - 1]);
-    } else if (!crosses[v] && ti < t_pool.size()) {
-      ra.alloc[v].is_reg = true;
-      ra.alloc[v].reg = t_pool[ti++];
-    } else {
-      ra.alloc[v].slot = slot_id++;
-      ++ra.spilled;
+    } else if (crosses[v]) {  // 跨调用:s 寄存器
+      std::string r = take_reg(s_act, s_pool, v, end, slot_id);
+      if (!r.empty()) {
+        ra.alloc[v] = {true, r, -1};
+        push_used_s(r);
+      } else {
+        ra.alloc[v] = {false, "", slot_id++};
+      }
+    } else {  // 不跨调用:t 池;实参偏好其 a_i(定义直写,调用零搬运)
+      std::string prefer;
+      auto ap = arg_pos.find(v);
+      if (ap != arg_pos.end()) prefer = "a" + std::to_string(ap->second);
+      std::string r;
+      if (!prefer.empty() && !t_act.m.count(prefer)) {
+        t_act.m[prefer] = {v, end};
+        r = prefer;
+      } else {
+        r = take_reg(t_act, t_pool, v, end, slot_id);
+      }
+      if (!r.empty()) ra.alloc[v] = {true, r, -1};
+      else ra.alloc[v] = {false, "", slot_id++};
     }
+    if (!ra.alloc[v].is_reg && ra.alloc[v].slot >= 0) ++ra.spilled;
   }
   return ra;
 }

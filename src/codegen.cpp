@@ -283,6 +283,20 @@ struct FuncGen {
     if ((next.op != IROp::BRZ && next.op != IROp::BRNZ) || next.rs1 != in.rd) return false;
     if (use_count[in.rd] != 1) return false;  // 结果被多处使用则不能融合
 
+    // !x + 分支 → 单操作数分支(brz !x ⟺ x≠0 → bnez;brnz !x ⟺ x==0 → beqz)
+    if (in.op == IROp::NOT) {
+      Operand A = operand_of(in.rs1);
+      std::string x;
+      if (A.in_reg) x = A.reg;
+      else {
+        a.line("  lw t0, " + std::to_string(A.slot) + "(sp)");
+        x = "t0";
+      }
+      a.line(std::string("  ") + (next.op == IROp::BRZ ? "bnez " : "beqz ") + x + ", " +
+             next.label);
+      return true;
+    }
+
     Operand A = operand_of(in.rs1), B = operand_of(in.rs2);
     std::string x, y;
     if (A.in_reg) x = A.reg;
@@ -416,6 +430,7 @@ struct FuncGen {
       }
       case IROp::NEG:
       case IROp::NOT: {
+        if (in.op == IROp::NOT && try_fuse_cmp_branch(in, idx)) return true;
         Operand A = operand_of(in.rs1), R = operand_of(in.rd);
         if (R.in_reg) {
           if (A.in_reg) {
