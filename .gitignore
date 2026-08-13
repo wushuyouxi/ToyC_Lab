@@ -2,3 +2,4 @@ build/
 tools/*.jar
 *.exe
 *.obj
+*.class
