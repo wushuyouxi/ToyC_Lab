@@ -1,0 +1,5 @@
+// 语义错误:循环外使用 break
+int main() {
+    break;
+    return 0;
+}

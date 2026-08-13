@@ -1,0 +1,6 @@
+// 语义错误:对 const 赋值
+int main() {
+    const int a = 5;
+    a = 6;
+    return 0;
+}

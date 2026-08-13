@@ -1,0 +1,10 @@
+// 性能:递归 fib(25) = 75025 → 75025 % 256 = 17
+// expect: 17
+int fib(int n) {
+    if (n <= 1) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+
+int main() {
+    return fib(25) % 256;
+}

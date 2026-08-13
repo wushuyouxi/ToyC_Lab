@@ -1,0 +1,8 @@
+// 语义错误:调用写在被调函数声明之后(这里 main 在 g 之前定义)
+int main() {
+    return g();
+}
+
+int g() {
+    return 42;
+}

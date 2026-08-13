@@ -1,0 +1,9 @@
+// 语义错误:void 函数调用作赋值右值
+void f() {
+    return;
+}
+
+int main() {
+    int x = f();
+    return 0;
+}

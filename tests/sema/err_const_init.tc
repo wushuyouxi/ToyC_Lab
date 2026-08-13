@@ -1,0 +1,6 @@
+// 语义错误:const 初始化表达式不可编译期求值
+int main() {
+    int x = 3;
+    const int y = x + 1;
+    return y;
+}

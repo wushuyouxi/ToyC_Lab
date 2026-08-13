@@ -1,0 +1,19 @@
+// void 函数(含无 return 与裸 return 两种形态)、void 调用作语句
+// expect: 123
+int g = 0;
+
+void bump() {
+    g = g + 1;
+}
+
+void noop() {
+    return;
+}
+
+int main() {
+    bump();
+    bump();
+    noop();
+    g = g * 41;  // 2*41 = 82
+    return g + 41;  // 123
+}

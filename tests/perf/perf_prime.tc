@@ -1,0 +1,20 @@
+// 性能:统计 2..199 的素数个数(46 个),双循环 + 除法
+// expect: 46
+int is_prime(int n) {
+    int d = 2;
+    while (d * d <= n) {
+        if (n % d == 0) return 0;
+        d = d + 1;
+    }
+    return 1;
+}
+
+int main() {
+    int count = 0;
+    int n = 2;
+    while (n < 200) {
+        count = count + is_prime(n);
+        n = n + 1;
+    }
+    return count;
+}

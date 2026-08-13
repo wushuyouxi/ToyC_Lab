@@ -1,0 +1,13 @@
+// 基础:全局常量、全局变量、while 循环、算术
+// expect: 45
+const int N = 10;
+int sum = 0;
+
+int main() {
+    int i = 0;
+    while (i < N) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}

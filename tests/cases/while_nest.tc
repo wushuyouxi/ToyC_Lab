@@ -1,0 +1,18 @@
+// 嵌套循环:内层 break 只跳出内层;continue 跳回本层条件
+// expect: 165
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 5) {
+        i = i + 1;
+        int j = 0;
+        while (j < 10) {
+            j = j + 1;
+            if (j % 4 == 0) continue;  // 跳过 4 和 8
+            if (j > 8) break;          // 跳出内层
+            s = s + i * j;
+        }
+    }
+    // 内层每轮: j=1..8 去掉 4,8 → 6 项:i*(1+2+3+5+6+7) = i*24;i=1..5 → 24*15 = 360
+    return s % 195;  // 360 % 195 = 165
+}

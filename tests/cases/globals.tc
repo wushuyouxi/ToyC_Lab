@@ -1,0 +1,9 @@
+// 全局变量读写与全局常量
+// expect: 27
+int g = 100;
+const int K = 7;
+
+int main() {
+    g = g + K;
+    return g % 40;  // 107 % 40 = 27
+}
