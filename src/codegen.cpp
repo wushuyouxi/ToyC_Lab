@@ -297,16 +297,16 @@ struct FuncGen {
       return true;
     }
 
-    Operand A = operand_of(in.rs1), B = operand_of(in.rs2);
+    Operand opA = operand_of(in.rs1), opB = operand_of(in.rs2);
     std::string x, y;
-    if (A.in_reg) x = A.reg;
+    if (opA.in_reg) x = opA.reg;
     else {
-      a.line("  lw t0, " + std::to_string(A.slot) + "(sp)");
+      a.line("  lw t0, " + std::to_string(opA.slot) + "(sp)");
       x = "t0";
     }
-    if (B.in_reg) y = B.reg;
+    if (opB.in_reg) y = opB.reg;
     else {
-      a.line("  lw t1, " + std::to_string(B.slot) + "(sp)");
+      a.line("  lw t1, " + std::to_string(opB.slot) + "(sp)");
       y = "t1";
     }
     // 查表:cmp op × 分支条件 → 真实分支指令(x,y 顺序已含语义)
