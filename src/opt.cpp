@@ -768,161 +768,76 @@ bool hoist_loop_imm(IRFunction& f) {
   return true;
 }
 
-// ---------- 遍 8:受限编译期求值(常量传播的延伸) ----------
-// 从函数入口解释执行 IR(与 gcc 对已知行程计数循环的常量折叠同源):
-// 仅处理 LOADIMM/MOV/算术/比较/移位/跳转,严格按 int32 回绕语义;
-// 遇到 CALL、全局访问、未知操作数(形参)或超出指令预算立即放弃,保持原函数。
-// 解释执行走到 RETURN 且返回值已知 → 整个函数折叠为常数(或空函数)。
-// 预算上限保证只折叠"确定性有限循环"型程序;递归/含调用/含全局的程序不受影响。
-bool const_eval_function(IRFunction& f) {
-  const int64_t kBudget = 20000000;
+// ---------- 遍 7b:通用循环不变量外提(LICM) ----------
+// 循环体内、操作数全部定义在循环头之前的纯计算(算术/比较/移位/MOV,
+// 无 CALL、无全局访问)移到循环头之前——嵌套循环中只依赖外层变量的
+// 计算在每个内层迭代被重复求值,外提后只算一次;逐轮迭代可逐层外提。
+// 正确性:循环头只能由顺序流(首次进入)与回边进入(ToyC 无 goto),
+// 外提指令首次进入时执行、后续迭代复用;操作数定义于循环头之前保证值不变。
+bool hoist_loop_invariant(IRFunction& f) {
+  auto is_candidate = [](IROp op) {
+    switch (op) {
+      case IROp::MOV: case IROp::LOADIMM:
+      case IROp::ADD: case IROp::SUB: case IROp::MUL: case IROp::DIV: case IROp::REM:
+      case IROp::ADDK: case IROp::SUBK:
+      case IROp::NEG: case IROp::NOT:
+      case IROp::SHL: case IROp::SRL: case IROp::SRA:
+      case IROp::LT: case IROp::GT: case IROp::LE: case IROp::GE: case IROp::EQ: case IROp::NE:
+        return true;
+      default: return false;
+    }
+  };
   std::unordered_map<std::string, size_t> label_idx;
   for (size_t i = 0; i < f.code.size(); ++i)
     if (f.code[i].op == IROp::LABEL) label_idx[f.code[i].label] = i;
-
-  std::unordered_map<int, int32_t> val;
-  int64_t steps = 0;
-  size_t pc = 0;
-  while (pc < f.code.size()) {
-    if (++steps > kBudget) return false;  // 超预算:放弃折叠
-    const Instr& in = f.code[pc];
-    switch (in.op) {
-      case IROp::LABEL:
-      case IROp::ARG:  // 形参:值未知,不进 val
-        ++pc;
-        continue;
-      case IROp::JUMP: {
-        auto it = label_idx.find(in.label);
-        if (it == label_idx.end()) return false;
-        pc = it->second;
-        continue;
-      }
-      case IROp::BRZ: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        if (it->second == 0) {
-          auto l = label_idx.find(in.label);
-          if (l == label_idx.end()) return false;
-          pc = l->second;
-        } else {
-          ++pc;
-        }
-        continue;
-      }
-      case IROp::BRNZ: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        if (it->second != 0) {
-          auto l = label_idx.find(in.label);
-          if (l == label_idx.end()) return false;
-          pc = l->second;
-        } else {
-          ++pc;
-        }
-        continue;
-      }
-      case IROp::LOADIMM:
-        val[in.rd] = static_cast<int32_t>(in.imm);
-        break;
-      case IROp::MOV: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        val[in.rd] = it->second;
-        break;
-      }
-      case IROp::ADD: case IROp::SUB: case IROp::MUL: {
-        auto l = val.find(in.rs1), r = val.find(in.rs2);
-        if (l == val.end() || r == val.end()) return false;
-        int64_t a = l->second, b = r->second;
-        if (in.op == IROp::ADD) val[in.rd] = static_cast<int32_t>(a + b);
-        else if (in.op == IROp::SUB) val[in.rd] = static_cast<int32_t>(a - b);
-        else val[in.rd] = static_cast<int32_t>(a * b);
-        break;
-      }
-      case IROp::DIV: case IROp::REM: {
-        auto l = val.find(in.rs1), r = val.find(in.rs2);
-        if (l == val.end() || r == val.end()) return false;
-        int32_t a = l->second, b = r->second;
-        if (b == 0 || (a == INT32_MIN && b == -1)) return false;  // UB 域:放弃
-        val[in.rd] = (in.op == IROp::DIV) ? static_cast<int32_t>(a / b)
-                                          : static_cast<int32_t>(a % b);
-        break;
-      }
-      case IROp::ADDK: case IROp::SUBK: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        int64_t a = it->second;
-        val[in.rd] = (in.op == IROp::ADDK) ? static_cast<int32_t>(a + in.imm)
-                                           : static_cast<int32_t>(a - in.imm);
-        break;
-      }
-      case IROp::NEG: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        val[in.rd] = static_cast<int32_t>(-static_cast<int64_t>(it->second));
-        break;
-      }
-      case IROp::NOT: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        val[in.rd] = (it->second == 0) ? 1 : 0;
-        break;
-      }
-      case IROp::SHL: case IROp::SRL: case IROp::SRA: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        uint32_t a = static_cast<uint32_t>(it->second);
-        int k = static_cast<int>(in.imm) & 31;
-        if (in.op == IROp::SHL) val[in.rd] = static_cast<int32_t>(a << k);
-        else if (in.op == IROp::SRL) val[in.rd] = static_cast<int32_t>(a >> k);
-        else val[in.rd] = static_cast<int32_t>(static_cast<int32_t>(a) >> k);
-        break;
-      }
-      case IROp::LT: case IROp::GT: case IROp::LE: case IROp::GE:
-      case IROp::EQ: case IROp::NE: {
-        auto l = val.find(in.rs1), r = val.find(in.rs2);
-        if (l == val.end() || r == val.end()) return false;
-        int32_t a = l->second, b = r->second;
-        int res;
-        switch (in.op) {
-          case IROp::LT: res = (a < b) ? 1 : 0; break;
-          case IROp::GT: res = (a > b) ? 1 : 0; break;
-          case IROp::LE: res = (a <= b) ? 1 : 0; break;
-          case IROp::GE: res = (a >= b) ? 1 : 0; break;
-          case IROp::EQ: res = (a == b) ? 1 : 0; break;
-          default: res = (a != b) ? 1 : 0; break;
-        }
-        val[in.rd] = res;
-        break;
-      }
-      case IROp::RETURN: {
-        auto it = val.find(in.rs1);
-        if (it == val.end()) return false;
-        // 折叠:整个函数退化为"返回常数"
-        Instr li;
-        li.op = IROp::LOADIMM;
-        li.rd = 0;
-        li.imm = it->second;
-        Instr ret;
-        ret.op = IROp::RETURN;
-        ret.rs1 = 0;
-        f.code = {std::move(li), std::move(ret)};
-        f.max_vreg = 1;
-        return true;
-      }
-      case IROp::RETURNVOID: {
-        Instr r;
-        r.op = IROp::RETURNVOID;
-        f.code = {std::move(r)};
-        f.max_vreg = 0;
-        return true;
-      }
-      default:  // CALL / LOADGLOBAL / STOREGLOBAL 等:不可求值,放弃
-        return false;
+  std::vector<std::pair<size_t, size_t>> loops;  // [header, back_edge]
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    const Instr& in = f.code[i];
+    if (in.op == IROp::JUMP || in.op == IROp::BRZ || in.op == IROp::BRNZ) {
+      auto it = label_idx.find(in.label);
+      if (it != label_idx.end() && it->second < i) loops.push_back({it->second, i});
     }
-    ++pc;
   }
-  return false;  // 未走到 RETURN:放弃(理论上不可达,防御)
+  if (loops.empty()) return false;
+  std::vector<std::vector<size_t>> defs(f.max_vreg);
+  for (size_t i = 0; i < f.code.size(); ++i)
+    if (f.code[i].rd >= 0 && f.code[i].op != IROp::LABEL) defs[f.code[i].rd].push_back(i);
+
+  std::map<size_t, std::vector<Instr>> insert_before;
+  std::unordered_set<size_t> to_remove;
+  for (auto& L : loops) {
+    size_t h = L.first, e = L.second;
+    for (size_t i = h + 1; i <= e; ++i) {
+      if (to_remove.count(i)) continue;
+      const Instr& in = f.code[i];
+      if (!is_candidate(in.op)) continue;
+      if (in.rd < 0 || defs[in.rd].size() != 1) continue;  // rd 必须单定义
+      bool inv = true;
+      for (int v : {in.rs1, in.rs2}) {
+        if (v < 0) continue;
+        for (size_t d : defs[v])
+          if (d >= h) {  // 操作数在循环头之后有定义 → 非不变量
+            inv = false;
+            break;
+          }
+        if (!inv) break;
+      }
+      if (!inv) continue;
+      insert_before[h].push_back(in);
+      to_remove.insert(i);
+    }
+  }
+  if (to_remove.empty()) return false;
+  std::vector<Instr> out;
+  for (size_t i = 0; i < f.code.size(); ++i) {
+    auto it = insert_before.find(i);
+    if (it != insert_before.end())
+      for (auto& in : it->second) out.push_back(in);
+    if (to_remove.count(i)) continue;
+    out.push_back(f.code[i]);
+  }
+  f.code = std::move(out);
+  return true;
 }
 
 // ---------- 优化入口:各遍迭代至不动点 ----------
@@ -937,12 +852,11 @@ void optimize(IRModule& m) {
       changed |= coalesce_def_use(f);
       changed |= dead_code_elimination(f);
       changed |= hoist_loop_imm(f);
+      changed |= hoist_loop_invariant(f);
     }
     if (!changed) break;
   }
-  // 收尾 1:受限编译期求值(常量边界的纯局部循环整体折叠)
-  for (auto& f : m.functions) const_eval_function(f);
-  // 收尾 2:全局提升(每函数至多一次,否则会把入口加载自身再"提升"导致错误)
+  // 收尾:全局提升(每函数至多一次,否则会把入口加载自身再"提升"导致错误)
   for (auto& f : m.functions) {
     promote_globals(f);
     dead_code_elimination(f);  // 清理提升产生的死代码
